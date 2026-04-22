@@ -32,6 +32,8 @@ import type {
 import { EuphonySearchWindow } from '../search-window/search-window';
 import { NightjarToast } from '../toast/toast';
 import { EuphonyTokenWindow } from '../token-window/token-window';
+import type { LocalDataWorkerMessage } from './local-data-worker';
+import LocalDataWorkerInline from './local-data-worker?worker';
 import { RequestWorker } from './request-worker';
 import { URLManager } from './url-manager';
 
@@ -276,6 +278,19 @@ export class EuphonyApp extends LitElement {
 
   // URL manager
   urlManager: URLManager;
+  localDataWorker: Worker;
+  localDataWorkerRequestCount = 0;
+  get localDataWorkerRequestID() {
+    return this.localDataWorkerRequestCount++;
+  }
+  activeLocalDataWorkerRequestID: number | null = null;
+  localDataWorkerPendingRequests = new Map<
+    number,
+    {
+      resolve: () => void;
+      reject: (reason?: unknown) => void;
+    }
+  >();
 
   // Debouncers
   cacheInfoTooltipDebouncer: number | null = null;
@@ -287,6 +302,13 @@ export class EuphonyApp extends LitElement {
     super();
 
     this.urlManager = new URLManager(this);
+    this.localDataWorker = new LocalDataWorkerInline();
+    this.localDataWorker.addEventListener(
+      'message',
+      (e: MessageEvent<LocalDataWorkerMessage>) => {
+        this.localDataWorkerMessageHandler(e);
+      }
+    );
 
     // Update the configs based on the current URL
     this.urlManager.updateConfigsFromURL();
@@ -378,6 +400,11 @@ export class EuphonyApp extends LitElement {
           break;
       }
     });
+  }
+
+  disconnectedCallback(): void {
+    this.localDataWorker.terminate();
+    super.disconnectedCallback();
   }
 
   /**
@@ -786,12 +813,14 @@ export class EuphonyApp extends LitElement {
         break;
       }
       case 'Load from clipboard': {
+        this.isLoadingData = true;
         navigator.clipboard.readText().then(
-          clipText => {
-            this.loadDataFromText(clipText, 'clipboard');
+          async clipText => {
+            await this.loadDataFromText(clipText, 'clipboard');
           },
           (err: unknown) => {
             console.error('Failed to read clipboard contents: ', err);
+            this.isLoadingData = false;
           }
         );
         break;
@@ -1300,125 +1329,147 @@ export class EuphonyApp extends LitElement {
     }
   };
 
-  loadDataFromText = (sourceText: string, sourceName: 'clipboard' | 'file') => {
-    let allData: (Record<string, unknown> | string | Conversation)[] = [];
-    // Try to convert the source text to a JSON or JSONL file.
-    try {
-      const jsonData = JSON.parse(sourceText) as Record<string, unknown>;
-      allData = [jsonData];
-    } catch (_error) {
-      // Try to read each line as a JSON object
-      for (const line of sourceText.split('\n')) {
-        try {
-          allData.push(JSON.parse(line) as Record<string, unknown> | string);
-        } catch (_error) {
-          // pass
+  loadDataFromText = (
+    sourceText: string,
+    sourceName: 'clipboard' | 'file'
+  ) => {
+    this.curPage = 1;
+    this.resetHash();
+    const requestID = this.localDataWorkerRequestID;
+    this.activeLocalDataWorkerRequestID = requestID;
+
+    return new Promise<void>((resolve, reject) => {
+      this.localDataWorkerPendingRequests.set(requestID, { resolve, reject });
+      const message: LocalDataWorkerMessage = {
+        command: 'startParseData',
+        payload: {
+          requestID,
+          sourceName,
+          sourceText
         }
-      }
-    }
-
-    // Return if there is no data read
-    if (allData.length === 0) {
-      this.toastMessage = `Failed to read any JSON or JSONL data from your ${sourceName}. Please double check and try again.`;
-      this.toastType = 'error';
-      if (this.toastComponent) {
-        this.toastComponent.show();
-      }
-      return;
-    }
-
-    this.codexSessionData = [];
-
-    // Codex session JSONL is a stream of event objects, not Harmony
-    // conversations. Detect it early and render with the Codex component.
-    if (isCodexSessionJSONL(allData as unknown[])) {
-      this.codexSessionData = [allData as unknown[]];
-      this.allConversationData = [];
-      this.conversationData = [];
-      this.JSONData = [];
-      this.selectedConversationIDs = new Set();
-      this.dataType = DataType.CODEX;
-      this._totalConversationSize = 1;
-      this._totalConversationSizeIncludingUnfiltered = 1;
-      this.isLoadingFromCache = false;
-      this.isLoadingFromClipboard = true;
-
-      this.toastMessage = `Codex session loaded successfully from ${sourceName}`;
-      this.toastType = 'success';
-      if (this.toastComponent) {
-        this.toastComponent.show();
-      }
-      return;
-    }
-
-    // Validate the data
-    // If the data is not a conversation, we render it as JSON
-    if (!this.validateAndTransformConversations(allData)) {
-      this.toastMessage =
-        'Failed to find harmony-formatted data. Render JSON instead.';
-      this.toastType = 'warning';
-      if (this.toastComponent) {
-        this.toastComponent.show();
-      }
-
-      this.JSONData = allData as Record<string, unknown>[];
-      this.dataType = DataType.JSON;
-      this._totalConversationSize = allData.length;
-      this._totalConversationSizeIncludingUnfiltered = allData.length;
-      return;
-    }
-
-    // The data is valid conversation, so we render it as conversations
-    this._totalConversationSize = allData.length;
-    this._totalConversationSizeIncludingUnfiltered = allData.length;
-
-    // Set all the conversations as selected in editor mode
-    if (this.isEditorMode) {
-      this.selectedConversationIDs = new Set();
-      for (let i = 0; i < allData.length; i++) {
-        this.selectedConversationIDs.add(i);
-      }
-    }
-
-    // People might encode the JSON differently, so we need to load them based
-    // on the type
-    if (typeof allData[0] === 'string') {
-      const newData: Conversation[] = allData.map(item => {
-        if (typeof item === 'string') {
-          const parsed = parseConversationJSONString(item);
-          if (parsed === null) {
-            this.toastMessage = `Failed to format JSONL data from your ${sourceName}. Please double check and try again.`;
-            this.toastType = 'error';
-            if (this.toastComponent) {
-              this.toastComponent.show();
-            }
-            throw new Error('Failed to parse conversation JSON string');
-          }
-          return parsed;
-        }
-        return item as Conversation;
-      });
-      this.allConversationData = newData;
-      this.conversationData = newData;
-      this.dataType = DataType.CONVERSATION;
-    } else {
-      const typedData = allData as Conversation[];
-      this.allConversationData = typedData;
-      this.conversationData = typedData;
-      this.dataType = DataType.CONVERSATION;
-    }
-
-    // Update the cache info
-    this.isLoadingFromCache = false;
-    this.isLoadingFromClipboard = true;
-
-    // Show a successful toast
-    this.toastMessage = `Data loaded successfully from ${sourceName}`;
-    this.toastType = 'success';
-    if (this.toastComponent) {
-      this.toastComponent.show();
-    }
+      };
+      this.localDataWorker.postMessage(message);
+    });
   };
+
+  loadDataFromFile = (sourceFile: File) => {
+    this.curPage = 1;
+    this.resetHash();
+    const requestID = this.localDataWorkerRequestID;
+    this.activeLocalDataWorkerRequestID = requestID;
+
+    return new Promise<void>((resolve, reject) => {
+      this.localDataWorkerPendingRequests.set(requestID, { resolve, reject });
+      const message: LocalDataWorkerMessage = {
+        command: 'startParseData',
+        payload: {
+          requestID,
+          sourceName: 'file',
+          sourceFile
+        }
+      };
+      this.localDataWorker.postMessage(message);
+    });
+  };
+
+  localDataWorkerMessageHandler(e: MessageEvent<LocalDataWorkerMessage>) {
+    switch (e.data.command) {
+      case 'finishParseData': {
+        const { requestID, sourceName, dataType } = e.data.payload;
+        const pendingRequest =
+          this.localDataWorkerPendingRequests.get(requestID);
+        this.localDataWorkerPendingRequests.delete(requestID);
+        if (requestID !== this.activeLocalDataWorkerRequestID) {
+          pendingRequest?.resolve();
+          break;
+        }
+        blobPath = null;
+        this.isLoadingData = false;
+
+        this.codexSessionData = [];
+        this.allConversationData = [];
+        this.conversationData = [];
+        this.JSONData = [];
+
+        if (dataType === 'codex') {
+          this.codexSessionData = [e.data.payload.codexSessionData];
+          this.selectedConversationIDs = new Set();
+          this.dataType = DataType.CODEX;
+          this._totalConversationSize = 1;
+          this._totalConversationSizeIncludingUnfiltered = 1;
+          this.isLoadingFromCache = false;
+          this.isLoadingFromClipboard = true;
+
+          this.toastMessage = `Codex session loaded successfully from ${sourceName}`;
+          this.toastType = 'success';
+        } else if (dataType === 'json') {
+          this.JSONData = e.data.payload.jsonData;
+          this.dataType = DataType.JSON;
+          this._totalConversationSize = this.JSONData.length;
+          this._totalConversationSizeIncludingUnfiltered = this.JSONData.length;
+          this.isLoadingFromCache = false;
+          this.isLoadingFromClipboard = true;
+
+          this.toastMessage =
+            'Failed to find harmony-formatted data. Render JSON instead.';
+          this.toastType = 'warning';
+        } else {
+          const conversationData = e.data.payload.conversationData;
+          this._totalConversationSize = conversationData.length;
+          this._totalConversationSizeIncludingUnfiltered =
+            conversationData.length;
+
+          if (this.isEditorMode) {
+            this.selectedConversationIDs = new Set();
+            for (let i = 0; i < conversationData.length; i++) {
+              this.selectedConversationIDs.add(i);
+            }
+          }
+
+          this.allConversationData = conversationData;
+          this.conversationData = this.isEditorMode
+            ? conversationData
+            : conversationData.slice(
+                (this.curPage - 1) * this.itemsPerPage,
+                this.curPage * this.itemsPerPage
+              );
+          this.dataType = DataType.CONVERSATION;
+          this.isLoadingFromCache = false;
+          this.isLoadingFromClipboard = true;
+
+          this.toastMessage = `Data loaded successfully from ${sourceName}`;
+          this.toastType = 'success';
+        }
+
+        this.toastComponent?.show();
+        pendingRequest?.resolve();
+        break;
+      }
+
+      case 'error': {
+        const { requestID, sourceName, message } = e.data.payload;
+        const pendingRequest =
+          this.localDataWorkerPendingRequests.get(requestID);
+        this.localDataWorkerPendingRequests.delete(requestID);
+        if (requestID !== this.activeLocalDataWorkerRequestID) {
+          pendingRequest?.reject(new Error(message));
+          break;
+        }
+        this.isLoadingData = false;
+
+        this.toastMessage = `Failed to read any JSON or JSONL data from your ${sourceName}. Please double check and try again.\n\n${message}`;
+        this.toastType = 'error';
+        this.toastComponent?.show();
+        pendingRequest?.reject(new Error(message));
+        break;
+      }
+
+      default: {
+        console.error('Unknown local data worker message', e.data.command);
+        break;
+      }
+    }
+  }
 
   localFileInputChanged(e: Event) {
     const inputElement = e.target as HTMLInputElement;
@@ -1427,15 +1478,13 @@ export class EuphonyApp extends LitElement {
       return;
     }
 
-    file
-      .text()
-      .then(text => {
-        this.loadDataFromText(text, 'file');
-      })
+    this.isLoadingData = true;
+    this.loadDataFromFile(file)
       .catch((error: unknown) => {
         this.toastMessage = `Failed to read local file.\n\n${error}`;
         this.toastType = 'error';
         this.toastComponent?.show();
+        this.isLoadingData = false;
       })
       .finally(() => {
         inputElement.value = '';
