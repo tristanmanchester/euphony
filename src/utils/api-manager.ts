@@ -46,7 +46,7 @@ const isComparison = (data: unknown) => {
   return 'conversation' in data && 'completions' in data;
 };
 
-const extractConversationFromJSONL = (
+export const extractConversationFromJSONL = (
   data: unknown[]
 ): Conversation[] | null => {
   // Simple transformation to handle the case where the Conversation is stored
